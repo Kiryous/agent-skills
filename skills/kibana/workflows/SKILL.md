@@ -80,18 +80,43 @@ This writes (or merges) an `elastic-workflows` MCP server entry into your client
 
 Set these before running any of the bundled scripts:
 
-| Variable          | Required | Description                                                                    |
-| ----------------- | -------- | ------------------------------------------------------------------------------ |
-| `KIBANA_URL`      | Yes      | Kibana base URL (e.g. `http://localhost:5601` or `https://my.kb.elastic-cloud.com`) |
-| `KIBANA_API_KEY`  | No       | API key for authentication (preferred)                                         |
-| `KIBANA_USERNAME` | No       | Username for basic auth (falls back to `ELASTICSEARCH_USERNAME`)               |
-| `KIBANA_PASSWORD` | No       | Password for basic auth (falls back to `ELASTICSEARCH_PASSWORD`)               |
-| `KIBANA_SPACE_ID` | No       | Kibana space ID (omit for default space)                                       |
-| `KIBANA_INSECURE` | No       | Set to `true` to skip TLS verification (local dev only)                        |
+| Variable                | Required | Description                                                                                  |
+| ----------------------- | -------- | -------------------------------------------------------------------------------------------- |
+| `KIBANA_URL`            | Yes      | Kibana base URL (e.g. `http://localhost:5601` or `https://my.kb.elastic-cloud.com`)          |
+| `KIBANA_API_KEY`        | No       | Preferred. Explicit Kibana API key for the auth header.                                      |
+| `ELASTICSEARCH_API_KEY` | No       | Cloud Management skill handoff (see "Bootstrap from cloud-manage-project" below).            |
+| `KIBANA_USERNAME`       | No       | Username for basic auth (falls back to `ELASTICSEARCH_USERNAME`)                             |
+| `KIBANA_PASSWORD`       | No       | Password for basic auth (falls back to `ELASTICSEARCH_PASSWORD`)                             |
+| `KIBANA_SPACE_ID`       | No       | Kibana space ID (omit for default space)                                                     |
+| `KIBANA_INSECURE`       | No       | Set to `true` to skip TLS verification (local dev only)                                      |
 
-Provide either `KIBANA_API_KEY` or `KIBANA_USERNAME` + `KIBANA_PASSWORD`. The same credentials drive the MCP client when `setup-mcp.js` writes the auth header. With `KIBANA_API_KEY` the script emits a `${env:KIBANA_API_KEY}` substitution so the secret stays in your shell environment; with basic auth it writes the Base64-encoded `username:password` directly into the MCP client config (acceptable for local dev, but prefer an API key elsewhere).
+Auth precedence: `KIBANA_API_KEY` → `ELASTICSEARCH_API_KEY` → `KIBANA_USERNAME` + `KIBANA_PASSWORD`. The same credentials drive both the bundled scripts and the MCP client that `setup-mcp.js` writes. With either API-key form the script emits a `${env:VAR_NAME}` substitution so the secret stays in your shell environment; with basic auth it writes the Base64-encoded `username:password` directly into the MCP client config (acceptable for local dev, but prefer an API key elsewhere).
 
 If the script reports a connection error, stop and tell the user to verify their `KIBANA_URL` and authentication environment variables.
+
+#### Bootstrap from `cloud-manage-project` (Elastic Cloud Serverless)
+
+If the user is on Elastic Cloud Serverless and has the [`cloud-manage-project`](https://github.com/elastic/agent-skills/tree/main/skills/cloud/manage-project) skill installed, they do **not** need to manually export `KIBANA_URL` or `KIBANA_API_KEY`. The cloud skill's `load-credentials` helper exports both `KIBANA_URL` and `ELASTICSEARCH_API_KEY` in one shot:
+
+```bash
+# (one-off, if a project doesn't exist yet)
+python3 .../skills/cloud/create-project/scripts/create-project.py create \
+  --type elasticsearch --name my-workflow-poc --region gcp-us-central1 \
+  --optimized-for general_purpose --wait
+
+# every session — exports KIBANA_URL + ELASTICSEARCH_API_KEY for this shell
+eval $(python3 .../skills/cloud/manage-project/scripts/manage-project.py \
+  load-credentials --name my-workflow-poc)
+
+# now setup-mcp.js / smoke.js / workflow-manager.js work without further env vars
+node skills/kibana/workflows/scripts/setup-mcp.js
+```
+
+Caveats when using this path:
+
+- **The API key needs `agentBuilder:read`** to call `/api/agent_builder/mcp`, plus `workflowsManagement` privileges for the workflow REST routes used by `workflow-manager.js`. Create the scoped key via the [`elasticsearch-authn`](https://github.com/elastic/agent-skills/tree/main/skills/elasticsearch/elasticsearch-authn) skill or in **Kibana → Stack Management → API keys**, then save it to `.elastic-credentials` so `load-credentials` picks it up.
+- **MCP clients see the env at launch time.** Cursor / Claude Desktop / Claude Code inherit the shell environment they were started in. Run `eval $(... load-credentials ...)` in the shell *before* launching (or restarting) the MCP client, otherwise `${env:ELASTICSEARCH_API_KEY}` will be empty and the MCP server will get `401`.
+- **Self-managed and local-dev Kibanas don't need any of this** — `KIBANA_API_KEY` (or `KIBANA_USERNAME` + `KIBANA_PASSWORD`) work the same as before.
 
 ## MCP setup
 
@@ -501,7 +526,9 @@ If something looks broken end-to-end, walk through these in order — they cover
 | --- | --- | --- |
 | `tools/list` returns 0 `platform.workflows.*` tools | `agentBuilder:experimentalFeatures` advanced setting is off | Enable it via the `curl` snippet under "Prerequisites → 1. Kibana with Agent Builder MCP enabled", or in **Stack Management → Advanced Settings** |
 | `/api/agent_builder/mcp` returns `403` | Kibana is on Basic license | Run `POST /_license/start_trial?acknowledge=true` against Elasticsearch (one-off) |
-| `KIBANA_URL is not set` from `setup-mcp.js` or `workflow-manager.js` | Env vars missing in the shell where you ran the script | `export KIBANA_URL=...` and `KIBANA_API_KEY` (or `KIBANA_USERNAME` + `KIBANA_PASSWORD`); rerun |
+| `KIBANA_URL is not set` from `setup-mcp.js` or `workflow-manager.js` | Env vars missing in the shell where you ran the script | `export KIBANA_URL=...` and `KIBANA_API_KEY` (or `KIBANA_USERNAME` + `KIBANA_PASSWORD`); rerun. On Cloud Serverless run `eval $(... cloud/manage-project/scripts/manage-project.py load-credentials --name <project>)` instead — that sets both `KIBANA_URL` and `ELASTICSEARCH_API_KEY` in one go. |
+| MCP `tools/list` returns `401 Unauthorized` after a `cloud-manage-project` handoff | The scoped API key in `.elastic-credentials` is missing `agentBuilder:read` (and/or `workflowsManagement` for the REST routes) | Recreate the scoped API key with both privileges (via `elasticsearch-authn` or **Stack Management → API keys**), update `.elastic-credentials`, re-`eval` `load-credentials`, and restart the MCP client |
+| `${env:ELASTICSEARCH_API_KEY}` resolves to empty in the MCP request and Kibana returns `401` | Cursor/Claude Code was launched before `eval $(... load-credentials ...)` ran in the shell | Run `eval` in the shell first, then quit and relaunch the MCP client so it inherits the new env |
 | `validate_workflow` returns "Invalid step type" diagnostics | Step type ID does not exist on this Kibana | Call `get_step_definitions` to discover valid IDs; never guess |
 | `get_connectors` returns nothing for a Slack/Jira step | No connector instance configured in the user's environment | Tell the user to create one in **Stack Management → Connectors** before referencing `connector-id` |
 | `run_workflow` returns `"workflow_disabled"` | Workflow saved with `enabled: false` | Set `enabled: true` in the YAML and redeploy |

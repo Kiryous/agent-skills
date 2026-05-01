@@ -11,28 +11,48 @@ const RETRY_DELAYS = [5, 10, 20];
 
 export function getKibanaConfig() {
   const url = process.env.KIBANA_URL;
-  const apiKey = process.env.KIBANA_API_KEY;
+  // Auth precedence:
+  //   1. KIBANA_API_KEY            — explicit, preferred.
+  //   2. ELASTICSEARCH_API_KEY     — Cloud Management skill handoff. The
+  //      cloud-manage-project skill's `eval $(... load-credentials --name <p>)`
+  //      command exports both KIBANA_URL and ELASTICSEARCH_API_KEY. Kibana
+  //      accepts the same `Authorization: ApiKey ...` header — the underlying
+  //      key just needs `agentBuilder:read` for MCP and `workflowsManagement`
+  //      privileges for workflow REST routes.
+  //   3. KIBANA_USERNAME + KIBANA_PASSWORD (or ELASTICSEARCH_USERNAME +
+  //      ELASTICSEARCH_PASSWORD) — Basic-auth fallback for local dev.
+  const apiKey = process.env.KIBANA_API_KEY || process.env.ELASTICSEARCH_API_KEY;
   const username = process.env.KIBANA_USERNAME || process.env.ELASTICSEARCH_USERNAME;
   const password = process.env.KIBANA_PASSWORD || process.env.ELASTICSEARCH_PASSWORD;
   const spaceId = process.env.KIBANA_SPACE_ID;
-  const insecure = process.env.KIBANA_INSECURE === "true";
+  const insecure = process.env.KIBANA_INSECURE === 'true';
 
   if (!url) {
-    console.error("Error: No Kibana connection configured.");
-    console.error("Set KIBANA_URL environment variable.");
+    console.error('Error: No Kibana connection configured.');
+    console.error('Set KIBANA_URL environment variable.');
+    console.error(
+      "Tip: cloud-manage-project's `eval $(... load-credentials --name <project>)` exports both KIBANA_URL and ELASTICSEARCH_API_KEY in one go."
+    );
     process.exit(1);
   }
 
-  if (!apiKey && !username && !password && process.env.KIBANA_NO_AUTH !== "true") {
-    console.error("Error: No Kibana authentication configured.");
-    console.error("Set KIBANA_API_KEY or KIBANA_USERNAME + KIBANA_PASSWORD.");
-    console.error("Or set KIBANA_NO_AUTH=true for clusters with security disabled.");
+  if (!apiKey && !username && !password && process.env.KIBANA_NO_AUTH !== 'true') {
+    console.error('Error: No Kibana authentication configured.');
+    console.error('Set one of:');
+    console.error('  - KIBANA_API_KEY (preferred)');
+    console.error(
+      '  - ELASTICSEARCH_API_KEY (auto-set by `eval $(.../cloud/manage-project/scripts/manage-project.py load-credentials --name <project>)`; the underlying key needs `agentBuilder:read`)'
+    );
+    console.error('  - KIBANA_USERNAME + KIBANA_PASSWORD (local dev only)');
+    console.error('Or set KIBANA_NO_AUTH=true for clusters with security disabled.');
     process.exit(1);
   }
 
   if (!apiKey && ((username && !password) || (!username && password))) {
-    console.error("Error: Both username and password must be set for basic auth.");
-    console.error("Set KIBANA_USERNAME + KIBANA_PASSWORD (or ELASTICSEARCH_USERNAME + ELASTICSEARCH_PASSWORD).");
+    console.error('Error: Both username and password must be set for basic auth.');
+    console.error(
+      'Set KIBANA_USERNAME + KIBANA_PASSWORD (or ELASTICSEARCH_USERNAME + ELASTICSEARCH_PASSWORD).'
+    );
     process.exit(1);
   }
 
@@ -41,25 +61,25 @@ export function getKibanaConfig() {
 
 function getHeaders(config) {
   const headers = {
-    "Content-Type": "application/json",
-    "kbn-xsrf": "true",
-    "User-Agent": "elastic-agentic",
+    'Content-Type': 'application/json',
+    'kbn-xsrf': 'true',
+    'User-Agent': 'elastic-agentic',
   };
 
   if (config.apiKey) {
-    headers["Authorization"] = `ApiKey ${config.apiKey}`;
+    headers['Authorization'] = `ApiKey ${config.apiKey}`;
   } else if (config.username && config.password) {
-    const auth = Buffer.from(`${config.username}:${config.password}`).toString("base64");
-    headers["Authorization"] = `Basic ${auth}`;
+    const auth = Buffer.from(`${config.username}:${config.password}`).toString('base64');
+    headers['Authorization'] = `Basic ${auth}`;
   }
 
   return headers;
 }
 
 function getBasePath(config, space) {
-  let basePath = config.url.replace(/\/$/, "");
+  let basePath = config.url.replace(/\/$/, '');
   const effectiveSpace = space || config.spaceId;
-  if (effectiveSpace && effectiveSpace !== "default") {
+  if (effectiveSpace && effectiveSpace !== 'default') {
     basePath += `/s/${effectiveSpace}`;
   }
   return basePath;
@@ -103,7 +123,7 @@ export async function kibanaFetch(path, options = {}) {
   };
 
   if (config.insecure) {
-    process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+    process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
   }
 
   for (let attempt = 0; attempt <= RETRY_DELAYS.length; attempt++) {
@@ -112,14 +132,16 @@ export async function kibanaFetch(path, options = {}) {
 
       if (response.status === 429 && attempt < RETRY_DELAYS.length) {
         const delay = RETRY_DELAYS[attempt];
-        console.error(`Rate limited, retrying in ${delay}s (attempt ${attempt + 1}/${RETRY_DELAYS.length + 1})...`);
+        console.error(
+          `Rate limited, retrying in ${delay}s (attempt ${attempt + 1}/${RETRY_DELAYS.length + 1})...`
+        );
         await new Promise((r) => setTimeout(r, delay * 1000));
         continue;
       }
 
-      const contentType = response.headers.get("content-type");
+      const contentType = response.headers.get('content-type');
       let data;
-      if (contentType && contentType.includes("application/json")) {
+      if (contentType && contentType.includes('application/json')) {
         data = await response.json();
       } else {
         data = await response.text();
@@ -136,7 +158,7 @@ export async function kibanaFetch(path, options = {}) {
 
       return { success: true, data };
     } catch (error) {
-      if (attempt < RETRY_DELAYS.length && error.message?.includes("429")) {
+      if (attempt < RETRY_DELAYS.length && error.message?.includes('429')) {
         const delay = RETRY_DELAYS[attempt];
         console.error(`Rate limited, retrying in ${delay}s...`);
         await new Promise((r) => setTimeout(r, delay * 1000));
@@ -153,14 +175,14 @@ export async function kibanaFetch(path, options = {}) {
  * relied on exceptions for error handling).
  */
 export async function kibanaGet(path, params, space) {
-  const result = await kibanaFetch(path, { method: "GET", params, space });
+  const result = await kibanaFetch(path, { method: 'GET', params, space });
   if (!result.success) throw new Error(result.error || `HTTP ${result.status}`);
   return result.data;
 }
 
 export async function kibanaPost(path, body, space) {
   const result = await kibanaFetch(path, {
-    method: "POST",
+    method: 'POST',
     body: body !== undefined ? JSON.stringify(body) : undefined,
     space,
   });
@@ -170,7 +192,7 @@ export async function kibanaPost(path, body, space) {
 
 export async function kibanaPatch(path, body, space) {
   const result = await kibanaFetch(path, {
-    method: "PATCH",
+    method: 'PATCH',
     body: body !== undefined ? JSON.stringify(body) : undefined,
     space,
   });
@@ -180,7 +202,7 @@ export async function kibanaPatch(path, body, space) {
 
 export async function kibanaPut(path, body, space) {
   const result = await kibanaFetch(path, {
-    method: "PUT",
+    method: 'PUT',
     body: body !== undefined ? JSON.stringify(body) : undefined,
     space,
   });
@@ -189,18 +211,18 @@ export async function kibanaPut(path, body, space) {
 }
 
 export async function kibanaDelete(path, space) {
-  const result = await kibanaFetch(path, { method: "DELETE", space });
+  const result = await kibanaFetch(path, { method: 'DELETE', space });
   if (!result.success) throw new Error(result.error || `HTTP ${result.status}`);
   return result.data;
 }
 
 export async function testConnection(space) {
   try {
-    const status = await kibanaGet("/api/status", undefined, space);
+    const status = await kibanaGet('/api/status', undefined, space);
     const version = status?.version;
-    const versionStr = typeof version === "object" ? version?.number : version;
-    console.log(`Connected to Kibana: ${status?.name || "unknown"}`);
-    console.log(`Version: ${versionStr || "unknown"}`);
+    const versionStr = typeof version === 'object' ? version?.number : version;
+    console.log(`Connected to Kibana: ${status?.name || 'unknown'}`);
+    console.log(`Version: ${versionStr || 'unknown'}`);
     return true;
   } catch (error) {
     console.error(`Connection failed: ${error.message}`);

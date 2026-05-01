@@ -4,7 +4,24 @@
  *
  * Targets Cursor, Claude Code, and Claude Desktop. Uses `mcp-remote` to bridge
  * Kibana's HTTP MCP transport into a stdio MCP client and injects the Kibana
- * auth header from environment variables (no secrets are written to disk).
+ * auth header from environment variables (no API-key secrets are written to
+ * disk — Basic-auth credentials are inlined as a documented tradeoff).
+ *
+ * Auth precedence:
+ *   1. KIBANA_API_KEY            — explicit, works for any deployment.
+ *   2. ELASTICSEARCH_API_KEY     — Cloud Management skill handoff. The
+ *                                  `cloud-manage-project` skill's
+ *                                  `load-credentials` helper exports both
+ *                                  KIBANA_URL and ELASTICSEARCH_API_KEY when
+ *                                  the user runs:
+ *                                      eval $(.../manage-project.py
+ *                                             load-credentials --name <proj>)
+ *                                  Kibana accepts the same `Authorization:
+ *                                  ApiKey ...` header — the underlying API key
+ *                                  just needs the `agentBuilder:read`
+ *                                  privilege to call /api/agent_builder/mcp.
+ *   3. KIBANA_USERNAME + KIBANA_PASSWORD (or ELASTICSEARCH_USERNAME +
+ *      ELASTICSEARCH_PASSWORD)   — Basic-auth fallback for local dev.
  *
  * The MCP endpoint is filtered to a comma-separated list of namespaces so the
  * agent surface is limited to a curated set of workflow + platform tools. The
@@ -90,9 +107,16 @@ Options:
 
 Environment:
   KIBANA_URL            Kibana base URL (required unless --url is given).
-  KIBANA_API_KEY        API key for the auth header (preferred).
+                        Auto-set by the cloud-manage-project skill's
+                        \`eval $(... load-credentials --name <proj>)\`.
+  KIBANA_API_KEY        Preferred. Explicit Kibana API key for the auth header.
+  ELASTICSEARCH_API_KEY Cloud Management skill handoff — falls back to this
+                        when KIBANA_API_KEY is not set. Auto-set by the same
+                        cloud-manage-project \`load-credentials\` command. The
+                        underlying API key needs \`agentBuilder:read\`.
   KIBANA_USERNAME / KIBANA_PASSWORD
-                        Basic auth fallback if no API key is set.
+                        Basic-auth fallback for local dev. Falls back to
+                        ELASTICSEARCH_USERNAME / ELASTICSEARCH_PASSWORD.
 `);
 }
 
@@ -113,29 +137,47 @@ function buildMcpUrl(opts) {
 }
 
 function buildAuthHeader() {
-  const apiKey = process.env.KIBANA_API_KEY;
-  if (apiKey) {
-    return 'Authorization:ApiKey ${env:KIBANA_API_KEY}';
+  if (process.env.KIBANA_API_KEY) {
+    return {
+      header: 'Authorization:ApiKey ${env:KIBANA_API_KEY}',
+      source: 'KIBANA_API_KEY env var',
+    };
+  }
+  if (process.env.ELASTICSEARCH_API_KEY) {
+    return {
+      header: 'Authorization:ApiKey ${env:ELASTICSEARCH_API_KEY}',
+      source: 'ELASTICSEARCH_API_KEY env var (Cloud Management skill handoff)',
+    };
   }
   const username = process.env.KIBANA_USERNAME || process.env.ELASTICSEARCH_USERNAME;
   const password = process.env.KIBANA_PASSWORD || process.env.ELASTICSEARCH_PASSWORD;
   if (username && password) {
     const encoded = Buffer.from(`${username}:${password}`).toString('base64');
-    return `Authorization:Basic ${encoded}`;
+    return {
+      header: `Authorization:Basic ${encoded}`,
+      source: `Basic auth as "${username}" (inlined into MCP config)`,
+    };
   }
   console.error(
-    'Error: No Kibana auth configured. Set KIBANA_API_KEY or KIBANA_USERNAME + KIBANA_PASSWORD before running setup.'
+    'Error: No Kibana auth configured. Set one of:\n' +
+      '  - KIBANA_API_KEY (preferred)\n' +
+      '  - ELASTICSEARCH_API_KEY (run `eval $(.../cloud/manage-project/scripts/manage-project.py load-credentials --name <project>)`\n' +
+      '    from the cloud-manage-project skill, then ensure the underlying API key has `agentBuilder:read`)\n' +
+      '  - KIBANA_USERNAME + KIBANA_PASSWORD (local dev only)'
   );
   process.exit(1);
 }
 
 function buildServerEntry(opts) {
   const mcpUrl = buildMcpUrl(opts);
-  const authHeader = buildAuthHeader();
+  const auth = buildAuthHeader();
   return {
-    type: 'stdio',
-    command: 'npx',
-    args: ['-y', 'mcp-remote', mcpUrl, '--header', authHeader],
+    entry: {
+      type: 'stdio',
+      command: 'npx',
+      args: ['-y', 'mcp-remote', mcpUrl, '--header', auth.header],
+    },
+    authSource: auth.source,
   };
 }
 
@@ -222,11 +264,12 @@ async function main() {
   }
 
   const name = opts.name || DEFAULT_NAME;
-  const entry = buildServerEntry(opts);
+  const { entry, authSource } = buildServerEntry(opts);
   const mcpUrl = buildMcpUrl(opts);
 
   console.log(`Elastic MCP endpoint: ${mcpUrl}`);
   console.log(`Server entry name:    ${name}`);
+  console.log(`Auth:                 ${authSource}`);
   console.log('');
 
   if (opts.dryRun) {
