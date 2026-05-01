@@ -19,6 +19,25 @@ Create, modify, validate, deploy, and run Elastic Workflow YAML definitions from
 
 If the user provided a path, treat **$ARGUMENTS** as the default workflow file.
 
+## Try it in 60 seconds
+
+Once a Kibana with the Agent Builder MCP endpoint is running, this entire loop should succeed unattended:
+
+```bash
+# 1. Install the skill from a local agent-skills checkout (or from GitHub).
+gh skill install /path/to/agent-skills kibana-workflows --from-local --agent cursor --scope user
+
+# 2. Wire your MCP client to Kibana (writes ~/.cursor/mcp.json or equivalent).
+export KIBANA_URL=https://my.kb.elastic-cloud.com
+export KIBANA_API_KEY=...   # or KIBANA_USERNAME + KIBANA_PASSWORD
+node skills/kibana/workflows/scripts/setup-mcp.js
+
+# 3. Confirm the full lifecycle works end-to-end against your Kibana.
+node skills/kibana/workflows/scripts/smoke.js
+```
+
+`smoke.js` writes a sample YAML, validates it, deploys it, runs it, polls execution status until terminal, fetches logs, and deletes the workflow. It exits non-zero on any failure with the offending step and reason — use it as a sanity check before reaching for the agent.
+
 ## How This Skill Works
 
 Workflow authoring inside Kibana uses the in-product workflow editor and a set of Agent Builder tools. From outside Kibana the architecture is split into two halves:
@@ -81,10 +100,13 @@ If the script reports a connection error, stop and tell the user to verify their
 `setup-mcp.js` configures one MCP server, by default named `elastic-workflows`, pointing at:
 
 ```
-${KIBANA_URL}/api/agent_builder/mcp?namespace=platform.workflows
+${KIBANA_URL}/api/agent_builder/mcp?namespace=platform.workflows,platform.core
 ```
 
-The `namespace=platform.workflows` filter restricts the MCP surface to workflow authoring tools only — it does not expose every Agent Builder tool.
+The `namespace` filter restricts the MCP surface to a curated set of namespaces so the agent does not get drowned in 50+ unrelated tools. The default exposes:
+
+- `platform.workflows.*` — workflow authoring + lifecycle (`validate_workflow`, `get_step_definitions`, `get_examples`, `deploy_workflow`, `run_workflow`, …)
+- `platform.core.*` — execution inspection + general-purpose Elastic tools (`get_workflow_execution_status`, `resume_workflow_execution`, `get_index_mapping`, `list_indices`, `generate_esql`, `execute_esql`, `cases`, `product_documentation`, …)
 
 It uses [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) to bridge the HTTP MCP transport into a stdio MCP client and injects the Kibana auth header from your environment.
 
@@ -100,29 +122,47 @@ node skills/kibana/workflows/scripts/setup-mcp.js --client cursor --client claud
 # Print the MCP server JSON without writing any file.
 node skills/kibana/workflows/scripts/setup-mcp.js --dry-run
 
-# Use a custom server name or namespace filter.
+# Narrow or broaden the exposed tool surface.
+node skills/kibana/workflows/scripts/setup-mcp.js --namespace platform.workflows
+node skills/kibana/workflows/scripts/setup-mcp.js --namespace platform.workflows,platform.core,platform.streams
+
+# Use a custom server name (handy if you also have a generic Elastic MCP entry).
 node skills/kibana/workflows/scripts/setup-mcp.js --name my-elastic-workflows
-node skills/kibana/workflows/scripts/setup-mcp.js --namespace platform.workflows,platform.core
 ```
 
 Supported clients in the POC: `cursor`, `claude-code`, `claude-desktop`. Reruns are idempotent — the script merges the entry rather than appending duplicates.
 
 ### Available MCP tools
 
-After setup, the workflow authoring tools are exposed to your agent under their full `platform.workflows.*` IDs:
+After setup, the agent has access to two groups of tools.
 
-**Lookup tools (use these):**
-- `platform.workflows.get_step_definitions` — Look up available step types, their `with` params, config params, and examples
-- `platform.workflows.get_trigger_definitions` — Look up available trigger types and their event schemas
-- `platform.workflows.get_examples` — Search the bundled example library for working workflow YAML patterns
-- `platform.workflows.get_connectors` — Find connector instances configured in the user's environment
-- `platform.workflows.validate_workflow` — Validate a complete workflow YAML string. When validation fails, step definitions for referenced step types are automatically included in the response.
+**Authoring + lifecycle (`platform.workflows.*`):**
 
-**Edit tools (DO NOT use over MCP):**
+| Tool | Purpose |
+| --- | --- |
+| `get_step_definitions` | Look up available step types, their `with` params, config params, and examples. |
+| `get_trigger_definitions` | Look up available trigger types and their event schemas. |
+| `get_examples` | Search the bundled example library for working YAML patterns. |
+| `get_connectors` | Find connector instances configured in the user's environment. |
+| `validate_workflow` | Validate a complete workflow YAML string. When validation fails, step definitions for referenced step types are automatically included in the response. |
+| `deploy_workflow` | Create or update a workflow from YAML. Pass `id` to update in place; omit to create. |
+| `run_workflow` | Execute a deployed workflow (by `workflowId`) or an unsaved draft (by inline `yaml`). Returns a `workflowExecutionId`. |
 
-The `platform.workflows.workflow_*` edit tools (`workflow_set_yaml`, `workflow_insert_step`, `workflow_modify_step`, `workflow_modify_step_property`, `workflow_modify_property`, `workflow_delete_step`) are designed for the in-Kibana editor. They mutate a `workflow.yaml` attachment that does not exist outside Kibana. **From an external agent, edit the local YAML file directly with Read / Write / Edit and revalidate via `validate_workflow`.**
+**Execution inspection + general-purpose (`platform.core.*`):**
 
-If you ever see those tools in your tool list, ignore them and go through the local-file flow described below.
+| Tool | Purpose |
+| --- | --- |
+| `get_workflow_execution_status` | Status (and final output, when complete) for a `workflowExecutionId`. |
+| `resume_workflow_execution` | Resume an execution that is `waiting_for_input`. |
+| `get_index_mapping` | Index mapping for one or more Elasticsearch indices. |
+| `list_indices` / `index_explorer` | Discover what indices exist in the cluster. |
+| `generate_esql` / `execute_esql` | Author and run ES\|QL queries against the cluster. |
+| `cases` | Read / write Kibana Cases. |
+| `product_documentation` | Search Elastic documentation for relevant guidance. |
+
+**In-Kibana edit tools — not exposed by default.**
+
+The `platform.workflows.workflow_*` edit tools (`workflow_set_yaml`, `workflow_insert_step`, `workflow_modify_step`, `workflow_modify_step_property`, `workflow_modify_property`, `workflow_delete_step`) are designed for the in-Kibana editor — they mutate a `workflow.yaml` attachment that does not exist outside Kibana. They are gated behind the `agentBuilder:experimentalFeatures` advanced setting and, even when surfaced, should not be used from an external agent. **From outside Kibana, edit the local YAML file directly with Read / Write / Edit and revalidate via `validate_workflow`.**
 
 ## Authoring Workflow
 
@@ -135,9 +175,11 @@ Use this loop whenever you create or modify a workflow `.yaml` file:
 5. **Discover connectors.** When wiring Slack / Jira / PagerDuty / etc., call `platform.workflows.get_connectors` so you reference real `connector-id` values.
 6. **Write or edit the local YAML** with your file tools.
 7. **Validate.** Call `platform.workflows.validate_workflow` with the full YAML string. If it returns errors, fix them in the file and revalidate.
-8. **Deploy / run.** Use `workflow-manager.js` (see below).
+8. **Deploy.** Call `platform.workflows.deploy_workflow` with the YAML (and `id` for an in-place update). Falls back to `workflow-manager.js deploy` if you need a non-MCP path.
+9. **Run.** Call `platform.workflows.run_workflow` to execute the deployed workflow (or an unsaved YAML draft). Capture the returned `workflowExecutionId`.
+10. **Inspect.** Call `platform.core.get_workflow_execution_status` with the `workflowExecutionId` to track progress; for richer diagnostics use `workflow-manager.js logs --execution-id <id>`.
 
-Skip steps 2–5 for trivial edits where you already know the correct shape.
+Skip steps 2–5 for trivial edits where you already know the correct shape. Prefer the MCP tools over the script when both are available — they keep the agent in a single tool-calling loop instead of shelling out.
 
 ## Workflow Manager Lifecycle
 
@@ -203,6 +245,42 @@ node skills/kibana/workflows/scripts/workflow-manager.js delete --id "<workflow_
 ```
 
 Always confirm with the user before deleting. Deletion is permanent.
+
+### Inspect executions
+
+After `run` or `test` returns a `workflowExecutionId`, use these to follow the run. The MCP `platform.core.get_workflow_execution_status` tool covers the same ground from the agent's side; these commands are the CI / Bash-friendly equivalents.
+
+```bash
+# List executions for a workflow.
+node skills/kibana/workflows/scripts/workflow-manager.js executions \
+  --workflow-id "<workflow_id>" \
+  --statuses running,completed --size 20
+
+# Get a single execution's details (optionally include input / output payloads).
+node skills/kibana/workflows/scripts/workflow-manager.js execution \
+  --id "<execution_id>" --include-input --include-output
+
+# Block until the execution reaches a terminal state (or timeout).
+node skills/kibana/workflows/scripts/workflow-manager.js poll \
+  --id "<execution_id>" --timeout 60 --interval 2
+
+# Fetch paginated logs (optionally filter to a single step execution).
+node skills/kibana/workflows/scripts/workflow-manager.js logs \
+  --execution-id "<execution_id>"
+```
+
+### End-to-end demo
+
+The full happy-path loop, from agent + skill perspective, is:
+
+1. `platform.workflows.get_examples` — pull a relevant example
+2. `platform.workflows.get_step_definitions` — confirm step IDs
+3. Edit `./workflows/<name>.yaml` locally
+4. `platform.workflows.validate_workflow` — fix any diagnostics
+5. `platform.workflows.deploy_workflow` (or `workflow-manager.js deploy`) — capture the workflow ID
+6. `platform.workflows.run_workflow` (or `workflow-manager.js run`) — capture the `workflowExecutionId`
+7. `platform.core.get_workflow_execution_status` (or `workflow-manager.js poll --id <execution_id>`) — wait for terminal status
+8. `workflow-manager.js logs --execution-id <id>` — surface logs to the user if anything looks off
 
 ## Workflow YAML Structure
 
@@ -414,3 +492,19 @@ For detailed YAML structure, examples, and Liquid templating reference, see [`re
 6. Validate before deploying; do NOT skip validation just because the change is large
 7. Confirm with the user before running `delete` — deletion is permanent
 8. For non-default Kibana spaces, set `KIBANA_SPACE_ID` before running scripts
+
+## Common errors
+
+If something looks broken end-to-end, walk through these in order — they cover ~90% of POC failures.
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `tools/list` returns 0 `platform.workflows.*` tools | `agentBuilder:experimentalFeatures` advanced setting is off | Enable it via the `curl` snippet under "Prerequisites → 1. Kibana with Agent Builder MCP enabled", or in **Stack Management → Advanced Settings** |
+| `/api/agent_builder/mcp` returns `403` | Kibana is on Basic license | Run `POST /_license/start_trial?acknowledge=true` against Elasticsearch (one-off) |
+| `KIBANA_URL is not set` from `setup-mcp.js` or `workflow-manager.js` | Env vars missing in the shell where you ran the script | `export KIBANA_URL=...` and `KIBANA_API_KEY` (or `KIBANA_USERNAME` + `KIBANA_PASSWORD`); rerun |
+| `validate_workflow` returns "Invalid step type" diagnostics | Step type ID does not exist on this Kibana | Call `get_step_definitions` to discover valid IDs; never guess |
+| `get_connectors` returns nothing for a Slack/Jira step | No connector instance configured in the user's environment | Tell the user to create one in **Stack Management → Connectors** before referencing `connector-id` |
+| `run_workflow` returns `"workflow_disabled"` | Workflow saved with `enabled: false` | Set `enabled: true` in the YAML and redeploy |
+| `run_workflow` returns `"workflow_invalid"` | Saved YAML failed validation | Re-validate locally, fix, redeploy |
+| MCP client never picks up the new server | Client not restarted after `setup-mcp.js` | Quit and relaunch Cursor / Claude Code / Claude Desktop |
+| `mcp-remote` shows `Method not found` errors | The MCP session was not initialized — usually a transient transport issue | Restart the MCP client; the wrapper handles `initialize` automatically on reconnect |

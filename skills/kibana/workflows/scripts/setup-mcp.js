@@ -6,53 +6,60 @@
  * Kibana's HTTP MCP transport into a stdio MCP client and injects the Kibana
  * auth header from environment variables (no secrets are written to disk).
  *
- * The MCP endpoint is filtered to a single namespace (default `platform.workflows`)
- * so only workflow authoring tools surface in the agent.
+ * The MCP endpoint is filtered to a comma-separated list of namespaces so the
+ * agent surface is limited to a curated set of workflow + platform tools. The
+ * default exposes both workflow authoring tools and the broader `platform.core`
+ * namespace, which already ships first-class tools we want to reuse:
+ *
+ *  - get_workflow_execution_status / resume_workflow_execution
+ *  - get_index_mapping / list_indices / index_explorer
+ *  - generate_esql / execute_esql
+ *  - cases / product_documentation
  */
 
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 try {
   process.loadEnvFile();
 } catch {}
 
-const DEFAULT_NAME = "elastic-workflows";
-const DEFAULT_NAMESPACE = "platform.workflows";
+const DEFAULT_NAME = 'elastic-workflows';
+const DEFAULT_NAMESPACE = 'platform.workflows,platform.core';
 
-const SUPPORTED_CLIENTS = ["cursor", "claude-code", "claude-desktop"];
+const SUPPORTED_CLIENTS = ['cursor', 'claude-code', 'claude-desktop'];
 
 function parseArgs(argv) {
   const result = { clients: [], dryRun: false };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === "--dry-run") {
+    if (arg === '--dry-run') {
       result.dryRun = true;
       continue;
     }
-    if (arg === "--client") {
+    if (arg === '--client') {
       const value = argv[++i];
       if (!value) {
-        console.error("Error: --client requires a value.");
+        console.error('Error: --client requires a value.');
         process.exit(1);
       }
       result.clients.push(value);
       continue;
     }
-    if (arg === "--name") {
+    if (arg === '--name') {
       result.name = argv[++i];
       continue;
     }
-    if (arg === "--namespace") {
+    if (arg === '--namespace') {
       result.namespace = argv[++i];
       continue;
     }
-    if (arg === "--url") {
+    if (arg === '--url') {
       result.url = argv[++i];
       continue;
     }
-    if (arg === "--help" || arg === "-h") {
+    if (arg === '--help' || arg === '-h') {
       result.help = true;
       continue;
     }
@@ -73,7 +80,10 @@ Options:
                         Repeatable. If omitted, all detected clients are updated.
   --name <name>         MCP server entry name (default: ${DEFAULT_NAME}).
   --namespace <ns>      Comma-separated namespace filter
-                        (default: ${DEFAULT_NAMESPACE}).
+                        (default: "${DEFAULT_NAMESPACE}"). Pass a narrower value
+                        like "platform.workflows" if you want workflow tools
+                        only, or "platform.workflows,platform.core,platform.streams"
+                        for an even broader surface.
   --url <url>           Override the Kibana base URL (defaults to KIBANA_URL).
   --dry-run             Print the resulting MCP server JSON, do not write files.
   -h, --help            Show this help.
@@ -89,10 +99,10 @@ Environment:
 function getKibanaUrl(opts) {
   const url = opts.url || process.env.KIBANA_URL;
   if (!url) {
-    console.error("Error: KIBANA_URL is not set. Pass --url or export KIBANA_URL.");
+    console.error('Error: KIBANA_URL is not set. Pass --url or export KIBANA_URL.');
     process.exit(1);
   }
-  return url.replace(/\/$/, "");
+  return url.replace(/\/$/, '');
 }
 
 function buildMcpUrl(opts) {
@@ -105,16 +115,16 @@ function buildMcpUrl(opts) {
 function buildAuthHeader() {
   const apiKey = process.env.KIBANA_API_KEY;
   if (apiKey) {
-    return "Authorization:ApiKey ${env:KIBANA_API_KEY}";
+    return 'Authorization:ApiKey ${env:KIBANA_API_KEY}';
   }
   const username = process.env.KIBANA_USERNAME || process.env.ELASTICSEARCH_USERNAME;
   const password = process.env.KIBANA_PASSWORD || process.env.ELASTICSEARCH_PASSWORD;
   if (username && password) {
-    const encoded = Buffer.from(`${username}:${password}`).toString("base64");
+    const encoded = Buffer.from(`${username}:${password}`).toString('base64');
     return `Authorization:Basic ${encoded}`;
   }
   console.error(
-    "Error: No Kibana auth configured. Set KIBANA_API_KEY or KIBANA_USERNAME + KIBANA_PASSWORD before running setup."
+    'Error: No Kibana auth configured. Set KIBANA_API_KEY or KIBANA_USERNAME + KIBANA_PASSWORD before running setup.'
   );
   process.exit(1);
 }
@@ -123,36 +133,36 @@ function buildServerEntry(opts) {
   const mcpUrl = buildMcpUrl(opts);
   const authHeader = buildAuthHeader();
   return {
-    type: "stdio",
-    command: "npx",
-    args: ["-y", "mcp-remote", mcpUrl, "--header", authHeader],
+    type: 'stdio',
+    command: 'npx',
+    args: ['-y', 'mcp-remote', mcpUrl, '--header', authHeader],
   };
 }
 
 function configPathFor(client) {
   switch (client) {
-    case "cursor":
-      return path.join(os.homedir(), ".cursor", "mcp.json");
-    case "claude-code":
-      return path.join(os.homedir(), ".claude.json");
-    case "claude-desktop":
-      if (process.platform === "darwin") {
+    case 'cursor':
+      return path.join(os.homedir(), '.cursor', 'mcp.json');
+    case 'claude-code':
+      return path.join(os.homedir(), '.claude.json');
+    case 'claude-desktop':
+      if (process.platform === 'darwin') {
         return path.join(
           os.homedir(),
-          "Library",
-          "Application Support",
-          "Claude",
-          "claude_desktop_config.json"
+          'Library',
+          'Application Support',
+          'Claude',
+          'claude_desktop_config.json'
         );
       }
-      if (process.platform === "win32") {
+      if (process.platform === 'win32') {
         return path.join(
-          process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"),
-          "Claude",
-          "claude_desktop_config.json"
+          process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'),
+          'Claude',
+          'claude_desktop_config.json'
         );
       }
-      return path.join(os.homedir(), ".config", "Claude", "claude_desktop_config.json");
+      return path.join(os.homedir(), '.config', 'Claude', 'claude_desktop_config.json');
     default:
       return null;
   }
@@ -173,7 +183,7 @@ function readJson(filePath) {
   if (!fs.existsSync(filePath)) {
     return {};
   }
-  const raw = fs.readFileSync(filePath, "utf8").trim();
+  const raw = fs.readFileSync(filePath, 'utf8').trim();
   if (!raw) {
     return {};
   }
@@ -186,7 +196,7 @@ function readJson(filePath) {
 
 function writeJson(filePath, value) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, JSON.stringify(value, null, 2) + "\n");
+  fs.writeFileSync(filePath, JSON.stringify(value, null, 2) + '\n');
 }
 
 function applyEntry(client, name, entry, configPath) {
@@ -217,10 +227,10 @@ async function main() {
 
   console.log(`Elastic MCP endpoint: ${mcpUrl}`);
   console.log(`Server entry name:    ${name}`);
-  console.log("");
+  console.log('');
 
   if (opts.dryRun) {
-    console.log("Dry run — would write the following MCP server entry:");
+    console.log('Dry run — would write the following MCP server entry:');
     console.log(JSON.stringify({ [name]: entry }, null, 2));
     return;
   }
@@ -236,12 +246,12 @@ async function main() {
 
   if (clients.length === 0) {
     console.log(
-      "No supported MCP clients detected (cursor, claude-code, claude-desktop). Pass --client to target one explicitly."
+      'No supported MCP clients detected (cursor, claude-code, claude-desktop). Pass --client to target one explicitly.'
     );
     return;
   }
 
-  console.log(`Targeting clients: ${clients.join(", ")}`);
+  console.log(`Targeting clients: ${clients.join(', ')}`);
   for (const client of clients) {
     const configPath = configPathFor(client);
     if (!configPath) {
@@ -255,8 +265,24 @@ async function main() {
     }
   }
 
-  console.log("");
-  console.log("Done. Restart your MCP client to pick up the new server entry.");
+  console.log('');
+  console.log('Done. Restart your MCP client to pick up the new server entry.');
+  console.log('');
+  console.log('Next steps:');
+  console.log('  1. Activate a trial license (one-off per cluster):');
+  console.log(
+    '     curl -u $KIBANA_USERNAME:$KIBANA_PASSWORD -X POST \\\n' +
+      '       "${KIBANA_URL/5601/9200}/_license/start_trial?acknowledge=true"'
+  );
+  console.log('  2. Enable agentBuilder:experimentalFeatures (one-off per Kibana space):');
+  console.log(
+    '     curl -u $KIBANA_USERNAME:$KIBANA_PASSWORD -X POST \\\n' +
+      '       "$KIBANA_URL/internal/kibana/settings/agentBuilder:experimentalFeatures" \\\n' +
+      '       -H "Content-Type: application/json" -H "kbn-xsrf: true" \\\n' +
+      '       -H "x-elastic-internal-origin: kibana" -d \'{"value": true}\''
+  );
+  console.log('  3. Restart your MCP client and verify with:');
+  console.log('     node skills/kibana/workflows/scripts/smoke.js');
 }
 
 main().catch((error) => {
